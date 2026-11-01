@@ -7,21 +7,23 @@ Every day 18:00 -> n8n #3: reminder to tomorrow's customers + tomorrow's list to
 Every 15 min -> n8n #4: mark No-show 30 min after slot start if not Arrived; tell owner + customer
 ```
 
+No AI or local LLM (Ollama etc.) needed: all logic is fixed rules.
+
 ## Install (Windows 10/11)
 
 Do steps 1-3 first, then run the installer.
 
 ### 1. Google Form
 
-Create a form with these questions. Titles must match exactly: they become sheet column headers.
+Create a form with these 7 questions, in this order. Titles must match exactly: they become sheet column headers. Extra questions may go after Notes; the automation ignores them.
 
 | Question | Type | Notes |
 |---|---|---|
 | Name | Short answer | required |
-| Phone | Short answer | required |
+| Phone | Short answer | required; the number linked to the customer's Telegram (matched on last 10 digits) |
 | Vehicle | Short answer | "Make / model / plate" |
 | Service | Dropdown | Basic Wash, Interior, Full Detail, Ceramic |
-| Date | Date | required |
+| Date | Date | required; "Include year" on, "Include time" off |
 | Time slot | Dropdown | 8:00, 10:00, 13:00, 15:00 (24h, one car per slot) |
 | Notes | Paragraph | optional |
 
