@@ -1,0 +1,675 @@
+{
+  "id": "carwashTgBot0001",
+  "name": "Carwash 2 - Telegram bot",
+  "nodes": [
+    {
+      "id": "telegram-trigger",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "carwashTelegram1",
+          "name": "Carwash Telegram Bot"
+        }
+      }
+    },
+    {
+      "id": "shared-contact-",
+      "name": "Shared contact?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.message.contact }}",
+              "rightValue": "",
+              "operator": {
+                "type": "object",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "read-bookings-for-command",
+      "name": "Read bookings for command",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Form Responses 1",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "carwashGoogle001",
+          "name": "Carwash Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "handle-command",
+      "name": "Handle command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Booking logic shared by the n8n Code nodes. build.js inlines everything above the\n// \"--- exports ---\" marker into the workflows; test/booking.test.js tests it.\n// Rows are Google Sheets rows as n8n reads them: column headers as keys, plus row_number.\n\nconst SLOTS = ['8:00', '10:00', '13:00', '15:00']; // must match the form's Time slot dropdown\nconst NO_SHOW_GRACE_MIN = 30;\nconst HOLDS = ['New', 'Confirmed', 'Arrived']; // statuses that occupy a slot\nconst ACTIVE = ['New', 'Confirmed']; // statuses that get reminders / can become No-show\nconst CHANGEABLE = ['New', 'Confirmed', 'Conflict', 'No-show']; // customer may reschedule or cancel\n\n// Last 10 digits, so \"0917 123 4567\" and \"+63 917 123 4567\" match.\nfunction digits(phone) {\n  return String(phone || '').replace(/\\D/g, '').slice(-10);\n}\n\n// \"10:00\", \"10:00:00\" or \"10:00 AM\" -> minutes since midnight. Sheets may reformat the\n// slot text, so slots are always compared by minutes. NaN if unreadable.\nfunction slotMinutes(slot) {\n  const m = String(slot || '').trim().match(/^(\\d{1,2})(?::(\\d{2}))?(?::\\d{2})?\\s*([ap])?\\.?m?\\.?$/i);\n  if (!m) return NaN;\n  let h = +m[1] % (m[3] ? 12 : 24);\n  if (m[3] && /p/i.test(m[3])) h += 12;\n  return h * 60 + (+m[2] || 0);\n}\n\nfunction validDate(s) {\n  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(s || '')) return false;\n  const d = new Date(s + 'T00:00:00Z');\n  return !isNaN(d) && d.toISOString().slice(0, 10) === s;\n}\n\nfunction freeSlots(rows, date, except) {\n  return SLOTS.filter(s => !rows.some(r => r !== except && r['Date'] === date\n    && HOLDS.includes(r['Status']) && slotMinutes(r['Time slot']) === slotMinutes(s)));\n}\n\nfunction findById(rows, id) {\n  const n = parseInt(String(id || '').replace(/\\D/g, ''), 10);\n  return rows.find(r => r['Booking ID'] && parseInt(String(r['Booking ID']).replace(/\\D/g, ''), 10) === n);\n}\n\nfunction summary(r) {\n  return [\n    `Booking ${r['Booking ID']} (${r['Status']})`,\n    `Name: ${r['Name']}`,\n    `Phone: ${r['Phone']}`,\n    `Vehicle: ${r['Vehicle']}`,\n    `Service: ${r['Service']}`,\n    `When: ${r['Date']} ${r['Time slot']}`,\n    r['Notes'] ? `Notes: ${r['Notes']}` : '',\n  ].filter(Boolean).join('\\n');\n}\n\nconst CUSTOMER_HELP = 'Commands:\\n/mybooking - show your booking\\n/slots YYYY-MM-DD - free times on a day\\n/reschedule YYYY-MM-DD HH:MM - move your booking\\n/cancel - cancel your booking';\nconst OWNER_HELP = 'Owner commands (ID like CW-0003 or 3):\\n/today - today\\'s bookings\\n/confirm ID\\n/arrived ID\\n/done ID\\n/noshow ID\\n/cancel ID\\n/move ID YYYY-MM-DD HH:MM\\n/slots YYYY-MM-DD';\nconst NO_SHOW_TEXT = (r) => `We missed you for booking ${r['Booking ID']} (${r['Date']} ${r['Time slot']}).\\nTo book a new time, send /slots YYYY-MM-DD then /reschedule YYYY-MM-DD HH:MM.`;\n\n// Workflow 1: give every row without a Booking ID an ID and a status.\n// Earlier rows win a slot; Cancelled, Conflict, No-show rows don't hold one.\nfunction processNewBookings(rows) {\n  const sorted = [...rows].sort((a, b) => a.row_number - b.row_number);\n  const out = [];\n  for (const row of sorted) {\n    if (row['Booking ID']) continue;\n    const clash = sorted.some(o => o !== row && o['Booking ID']\n      && HOLDS.includes(o['Status'])\n      && o['Date'] === row['Date'] && slotMinutes(o['Time slot']) === slotMinutes(row['Time slot']));\n    row['Booking ID'] = 'CW-' + String(row.row_number).padStart(4, '0');\n    row['Status'] = clash ? 'Conflict' : 'New';\n    const head = clash ? '⚠️ SLOT ALREADY TAKEN - contact customer to rebook\\n' : '🚗 New booking\\n';\n    const hint = clash ? `\\n\\n/move ${row['Booking ID']} YYYY-MM-DD HH:MM` : `\\n\\n/confirm ${row['Booking ID']}`;\n    out.push({ row_number: row.row_number, bookingId: row['Booking ID'], status: row['Status'], text: head + summary(row) + hint });\n  }\n  return out;\n}\n\n// Workflow 2: customer shared their contact with the bot; find their latest booking.\nfunction matchBooking(rows, message) {\n  const chatId = message.chat.id;\n  const contact = message.contact;\n  // A user can also send someone else's contact card; only accept their own number.\n  if (!contact || contact.user_id !== message.from.id) {\n    return { found: false, chatId, text: 'Please tap the \"Share my phone\" button to send your own number.' };\n  }\n  const phone = digits(contact.phone_number);\n  const row = phone.length >= 7\n    ? rows.filter(r => digits(r['Phone']) === phone && r['Status'] !== 'Cancelled').pop()\n    : undefined;\n  if (!row) {\n    return { found: false, chatId, text: 'No booking found for this number. Please book using our form first, then come back here.' };\n  }\n  const note = row['Status'] === 'Conflict'\n    ? '\\n\\nSorry, this time slot is already taken. Send /slots YYYY-MM-DD to see free times, then /reschedule.'\n    : '\\n\\nYou will get a reminder here the day before.';\n  return { found: true, chatId, row_number: row.row_number, text: '✅ Booking linked!\\n\\n' + summary(row) + note + '\\n\\n' + CUSTOMER_HELP };\n}\n\n// Shared by owner /move and customer /reschedule. Returns { error } or { update, from, to }.\nfunction reschedule(rows, row, date, slot, today, nowMin) {\n  if (!validDate(date)) return { error: 'Use: YYYY-MM-DD HH:MM, e.g. /reschedule 2026-11-05 10:00' };\n  const label = SLOTS.find(s => slotMinutes(s) === slotMinutes(slot));\n  if (!label) return { error: `Time must be one of: ${SLOTS.join(', ')}` };\n  if (date < today || (date === today && slotMinutes(label) <= nowMin)) return { error: 'That time has already passed.' };\n  const free = freeSlots(rows, date, row);\n  if (!free.includes(label)) return { error: `${date} ${label} is taken. Free that day: ${free.join(', ') || 'none'}` };\n  return {\n    update: rowUpdate(row, { Date: date, 'Time slot': label, Status: 'New', Reminded: '' }),\n    from: `${row['Date']} ${row['Time slot']}`,\n    to: `${date} ${label}`,\n  };\n}\n\n// The bot workflow writes these 5 columns back for the changed row.\nfunction rowUpdate(row, changes) {\n  return { row_number: row.row_number, Date: row['Date'], 'Time slot': row['Time slot'], Status: row['Status'], Reminded: row['Reminded'] || '', ...changes };\n}\n\n// Workflow 2: any non-contact message. owner = OWNER_CHAT_ID, today = \"YYYY-MM-DD\",\n// nowMin = minutes since midnight. Returns { askPhone } or { update|null, messages: [{chatId, text}] }.\nfunction handleCommand(rows, message, owner, today, nowMin) {\n  const chatId = message.chat.id;\n  const [first = '', ...args] = String(message.text || '').trim().split(/\\s+/);\n  const cmd = first.toLowerCase().replace(/@.*/, ''); // \"/today@MyBot\" in groups\n  const reply = (text) => ({ update: null, messages: [{ chatId, text }] });\n\n  if (cmd === '/slots') {\n    if (!validDate(args[0])) return reply('Use: /slots YYYY-MM-DD');\n    const free = freeSlots(rows, args[0]).filter(s => args[0] > today || (args[0] === today && slotMinutes(s) > nowMin));\n    return reply(`Free times on ${args[0]}: ${free.join(', ') || 'none'}`);\n  }\n\n  if (String(chatId) === String(owner)) {\n    if (cmd === '/today') return reply(ownerSummary(rows, today, 'Today').text);\n    const statuses = { '/confirm': 'Confirmed', '/arrived': 'Arrived', '/done': 'Done', '/noshow': 'No-show', '/cancel': 'Cancelled' };\n    if (!statuses[cmd] && cmd !== '/move') return reply(OWNER_HELP);\n    const row = findById(rows, args[0]);\n    if (!row) return reply(`Booking ${args[0] || '(missing ID)'} not found.`);\n    const customer = row['Chat ID'];\n    if (cmd === '/move') {\n      const r = reschedule(rows, row, args[1], args[2], today, nowMin);\n      if (r.error) return reply(r.error);\n      const messages = [{ chatId, text: `${row['Booking ID']} moved: ${r.from} -> ${r.to}` }];\n      if (customer) messages.push({ chatId: customer, text: `Your booking ${row['Booking ID']} was moved to ${r.to}.` });\n      return { update: r.update, messages };\n    }\n    const status = statuses[cmd];\n    const messages = [{ chatId, text: `${row['Booking ID']} (${row['Name']}) -> ${status}` }];\n    const notice = {\n      Confirmed: `✅ Your booking ${row['Booking ID']} on ${row['Date']} ${row['Time slot']} is confirmed.`,\n      Cancelled: `Your booking ${row['Booking ID']} on ${row['Date']} ${row['Time slot']} was cancelled.`,\n      'No-show': NO_SHOW_TEXT(row),\n      Done: 'Thanks for visiting! See you next time. 🚗✨',\n    }[status];\n    if (customer && notice) messages.push({ chatId: customer, text: notice });\n    return { update: rowUpdate(row, { Status: status }), messages };\n  }\n\n  const mine = rows.filter(r => r['Chat ID'] && String(r['Chat ID']) === String(chatId));\n  if (!mine.length) return { askPhone: true };\n  const row = mine.filter(r => CHANGEABLE.includes(r['Status'])).pop();\n  if (!row) return reply('You have no active booking. Please book again using our form.');\n\n  if (cmd === '/cancel') {\n    return {\n      update: rowUpdate(row, { Status: 'Cancelled' }),\n      messages: [\n        { chatId, text: `Your booking ${row['Booking ID']} is cancelled.` },\n        { chatId: owner, text: `❌ Customer cancelled ${row['Booking ID']} (${row['Name']}, ${row['Date']} ${row['Time slot']})` },\n      ],\n    };\n  }\n  if (cmd === '/reschedule') {\n    const r = reschedule(rows, row, args[0], args[1], today, nowMin);\n    if (r.error) return reply(r.error);\n    return {\n      update: r.update,\n      messages: [\n        { chatId, text: `✅ Booking ${row['Booking ID']} moved to ${r.to}. We will confirm shortly.` },\n        { chatId: owner, text: `🔁 Customer rescheduled ${row['Booking ID']} (${row['Name']}): ${r.from} -> ${r.to}\\n\\n/confirm ${row['Booking ID']}` },\n      ],\n    };\n  }\n  return reply(summary(row) + '\\n\\n' + CUSTOMER_HELP);\n}\n\n// Workflow 4: bookings still New/Confirmed (not Arrived) past slot start + grace time.\nfunction findNoShows(rows, today, nowMin) {\n  return rows\n    .filter(r => r['Date'] === today && ACTIVE.includes(r['Status']) && slotMinutes(r['Time slot']) + NO_SHOW_GRACE_MIN <= nowMin)\n    .map(r => ({\n      row_number: r.row_number,\n      chatId: String(r['Chat ID'] || ''),\n      customerText: NO_SHOW_TEXT(r),\n      ownerText: `🚫 No-show: ${r['Booking ID']} ${r['Name']} ${r['Phone']} (${r['Time slot']}). Marked No-show.\\nIf they came, send /arrived ${r['Booking ID']}`,\n    }));\n}\n\n// Workflow 3: customers to remind about tomorrow (tomorrow is \"YYYY-MM-DD\").\nfunction dueReminders(rows, tomorrow) {\n  return rows\n    .filter(r => r['Date'] === tomorrow && ACTIVE.includes(r['Status']) && r['Chat ID'] && !r['Reminded'])\n    .map(r => ({\n      row_number: r.row_number,\n      chatId: r['Chat ID'],\n      text: `⏰ Reminder: your ${r['Service']} is tomorrow (${r['Date']}) at ${r['Time slot']}.\\nBooking ${r['Booking ID']} - ${r['Vehicle']}.\\nNeed to change? /reschedule YYYY-MM-DD HH:MM or /cancel`,\n    }));\n}\n\n// Workflow 3 and owner /today: the day's schedule.\nfunction ownerSummary(rows, date, label = 'Tomorrow') {\n  const list = rows\n    .filter(r => r['Date'] === date && HOLDS.includes(r['Status']))\n    .sort((a, b) => slotMinutes(a['Time slot']) - slotMinutes(b['Time slot']));\n  if (!list.length) return { text: `📅 No bookings for ${label.toLowerCase()} (${date}).` };\n  const lines = list.map(r => `${r['Time slot']} - ${r['Booking ID']} ${r['Service']} - ${r['Name']} (${r['Vehicle']}) ${r['Phone']} [${r['Status']}]`);\n  return { text: `📅 ${label} (${date}) - ${list.length} booking(s):\\n` + lines.join('\\n') };\n}\n\n\n// --- node ---\nconst r = handleCommand($input.all().map(i => i.json), $('Telegram Trigger').first().json.message, 'OWNER_CHAT_ID', $now.toISODate(), $now.hour * 60 + $now.minute);\nreturn [{ json: { askPhone: !!r.askPhone, hasUpdate: !!r.update, update: r.update || {}, messages: r.messages || [] } }];"
+      }
+    },
+    {
+      "id": "not-linked-yet-",
+      "name": "Not linked yet?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.askPhone }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "changes-sheet-",
+      "name": "Changes sheet?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.hasUpdate }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "apply-change",
+      "name": "Apply change",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1540,
+        300
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Form Responses 1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "row_number": "={{ $json.update['row_number'] }}",
+            "Date": "={{ $json.update['Date'] }}",
+            "Time slot": "={{ $json.update['Time slot'] }}",
+            "Status": "={{ $json.update['Status'] }}",
+            "Reminded": "={{ $json.update['Reminded'] }}"
+          },
+          "matchingColumns": [
+            "row_number"
+          ],
+          "schema": [
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Date",
+              "displayName": "Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Time slot",
+              "displayName": "Time slot",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Reminded",
+              "displayName": "Reminded",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "carwashGoogle001",
+          "name": "Carwash Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "split-messages",
+      "name": "Split messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Booking logic shared by the n8n Code nodes. build.js inlines everything above the\n// \"--- exports ---\" marker into the workflows; test/booking.test.js tests it.\n// Rows are Google Sheets rows as n8n reads them: column headers as keys, plus row_number.\n\nconst SLOTS = ['8:00', '10:00', '13:00', '15:00']; // must match the form's Time slot dropdown\nconst NO_SHOW_GRACE_MIN = 30;\nconst HOLDS = ['New', 'Confirmed', 'Arrived']; // statuses that occupy a slot\nconst ACTIVE = ['New', 'Confirmed']; // statuses that get reminders / can become No-show\nconst CHANGEABLE = ['New', 'Confirmed', 'Conflict', 'No-show']; // customer may reschedule or cancel\n\n// Last 10 digits, so \"0917 123 4567\" and \"+63 917 123 4567\" match.\nfunction digits(phone) {\n  return String(phone || '').replace(/\\D/g, '').slice(-10);\n}\n\n// \"10:00\", \"10:00:00\" or \"10:00 AM\" -> minutes since midnight. Sheets may reformat the\n// slot text, so slots are always compared by minutes. NaN if unreadable.\nfunction slotMinutes(slot) {\n  const m = String(slot || '').trim().match(/^(\\d{1,2})(?::(\\d{2}))?(?::\\d{2})?\\s*([ap])?\\.?m?\\.?$/i);\n  if (!m) return NaN;\n  let h = +m[1] % (m[3] ? 12 : 24);\n  if (m[3] && /p/i.test(m[3])) h += 12;\n  return h * 60 + (+m[2] || 0);\n}\n\nfunction validDate(s) {\n  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(s || '')) return false;\n  const d = new Date(s + 'T00:00:00Z');\n  return !isNaN(d) && d.toISOString().slice(0, 10) === s;\n}\n\nfunction freeSlots(rows, date, except) {\n  return SLOTS.filter(s => !rows.some(r => r !== except && r['Date'] === date\n    && HOLDS.includes(r['Status']) && slotMinutes(r['Time slot']) === slotMinutes(s)));\n}\n\nfunction findById(rows, id) {\n  const n = parseInt(String(id || '').replace(/\\D/g, ''), 10);\n  return rows.find(r => r['Booking ID'] && parseInt(String(r['Booking ID']).replace(/\\D/g, ''), 10) === n);\n}\n\nfunction summary(r) {\n  return [\n    `Booking ${r['Booking ID']} (${r['Status']})`,\n    `Name: ${r['Name']}`,\n    `Phone: ${r['Phone']}`,\n    `Vehicle: ${r['Vehicle']}`,\n    `Service: ${r['Service']}`,\n    `When: ${r['Date']} ${r['Time slot']}`,\n    r['Notes'] ? `Notes: ${r['Notes']}` : '',\n  ].filter(Boolean).join('\\n');\n}\n\nconst CUSTOMER_HELP = 'Commands:\\n/mybooking - show your booking\\n/slots YYYY-MM-DD - free times on a day\\n/reschedule YYYY-MM-DD HH:MM - move your booking\\n/cancel - cancel your booking';\nconst OWNER_HELP = 'Owner commands (ID like CW-0003 or 3):\\n/today - today\\'s bookings\\n/confirm ID\\n/arrived ID\\n/done ID\\n/noshow ID\\n/cancel ID\\n/move ID YYYY-MM-DD HH:MM\\n/slots YYYY-MM-DD';\nconst NO_SHOW_TEXT = (r) => `We missed you for booking ${r['Booking ID']} (${r['Date']} ${r['Time slot']}).\\nTo book a new time, send /slots YYYY-MM-DD then /reschedule YYYY-MM-DD HH:MM.`;\n\n// Workflow 1: give every row without a Booking ID an ID and a status.\n// Earlier rows win a slot; Cancelled, Conflict, No-show rows don't hold one.\nfunction processNewBookings(rows) {\n  const sorted = [...rows].sort((a, b) => a.row_number - b.row_number);\n  const out = [];\n  for (const row of sorted) {\n    if (row['Booking ID']) continue;\n    const clash = sorted.some(o => o !== row && o['Booking ID']\n      && HOLDS.includes(o['Status'])\n      && o['Date'] === row['Date'] && slotMinutes(o['Time slot']) === slotMinutes(row['Time slot']));\n    row['Booking ID'] = 'CW-' + String(row.row_number).padStart(4, '0');\n    row['Status'] = clash ? 'Conflict' : 'New';\n    const head = clash ? '⚠️ SLOT ALREADY TAKEN - contact customer to rebook\\n' : '🚗 New booking\\n';\n    const hint = clash ? `\\n\\n/move ${row['Booking ID']} YYYY-MM-DD HH:MM` : `\\n\\n/confirm ${row['Booking ID']}`;\n    out.push({ row_number: row.row_number, bookingId: row['Booking ID'], status: row['Status'], text: head + summary(row) + hint });\n  }\n  return out;\n}\n\n// Workflow 2: customer shared their contact with the bot; find their latest booking.\nfunction matchBooking(rows, message) {\n  const chatId = message.chat.id;\n  const contact = message.contact;\n  // A user can also send someone else's contact card; only accept their own number.\n  if (!contact || contact.user_id !== message.from.id) {\n    return { found: false, chatId, text: 'Please tap the \"Share my phone\" button to send your own number.' };\n  }\n  const phone = digits(contact.phone_number);\n  const row = phone.length >= 7\n    ? rows.filter(r => digits(r['Phone']) === phone && r['Status'] !== 'Cancelled').pop()\n    : undefined;\n  if (!row) {\n    return { found: false, chatId, text: 'No booking found for this number. Please book using our form first, then come back here.' };\n  }\n  const note = row['Status'] === 'Conflict'\n    ? '\\n\\nSorry, this time slot is already taken. Send /slots YYYY-MM-DD to see free times, then /reschedule.'\n    : '\\n\\nYou will get a reminder here the day before.';\n  return { found: true, chatId, row_number: row.row_number, text: '✅ Booking linked!\\n\\n' + summary(row) + note + '\\n\\n' + CUSTOMER_HELP };\n}\n\n// Shared by owner /move and customer /reschedule. Returns { error } or { update, from, to }.\nfunction reschedule(rows, row, date, slot, today, nowMin) {\n  if (!validDate(date)) return { error: 'Use: YYYY-MM-DD HH:MM, e.g. /reschedule 2026-11-05 10:00' };\n  const label = SLOTS.find(s => slotMinutes(s) === slotMinutes(slot));\n  if (!label) return { error: `Time must be one of: ${SLOTS.join(', ')}` };\n  if (date < today || (date === today && slotMinutes(label) <= nowMin)) return { error: 'That time has already passed.' };\n  const free = freeSlots(rows, date, row);\n  if (!free.includes(label)) return { error: `${date} ${label} is taken. Free that day: ${free.join(', ') || 'none'}` };\n  return {\n    update: rowUpdate(row, { Date: date, 'Time slot': label, Status: 'New', Reminded: '' }),\n    from: `${row['Date']} ${row['Time slot']}`,\n    to: `${date} ${label}`,\n  };\n}\n\n// The bot workflow writes these 5 columns back for the changed row.\nfunction rowUpdate(row, changes) {\n  return { row_number: row.row_number, Date: row['Date'], 'Time slot': row['Time slot'], Status: row['Status'], Reminded: row['Reminded'] || '', ...changes };\n}\n\n// Workflow 2: any non-contact message. owner = OWNER_CHAT_ID, today = \"YYYY-MM-DD\",\n// nowMin = minutes since midnight. Returns { askPhone } or { update|null, messages: [{chatId, text}] }.\nfunction handleCommand(rows, message, owner, today, nowMin) {\n  const chatId = message.chat.id;\n  const [first = '', ...args] = String(message.text || '').trim().split(/\\s+/);\n  const cmd = first.toLowerCase().replace(/@.*/, ''); // \"/today@MyBot\" in groups\n  const reply = (text) => ({ update: null, messages: [{ chatId, text }] });\n\n  if (cmd === '/slots') {\n    if (!validDate(args[0])) return reply('Use: /slots YYYY-MM-DD');\n    const free = freeSlots(rows, args[0]).filter(s => args[0] > today || (args[0] === today && slotMinutes(s) > nowMin));\n    return reply(`Free times on ${args[0]}: ${free.join(', ') || 'none'}`);\n  }\n\n  if (String(chatId) === String(owner)) {\n    if (cmd === '/today') return reply(ownerSummary(rows, today, 'Today').text);\n    const statuses = { '/confirm': 'Confirmed', '/arrived': 'Arrived', '/done': 'Done', '/noshow': 'No-show', '/cancel': 'Cancelled' };\n    if (!statuses[cmd] && cmd !== '/move') return reply(OWNER_HELP);\n    const row = findById(rows, args[0]);\n    if (!row) return reply(`Booking ${args[0] || '(missing ID)'} not found.`);\n    const customer = row['Chat ID'];\n    if (cmd === '/move') {\n      const r = reschedule(rows, row, args[1], args[2], today, nowMin);\n      if (r.error) return reply(r.error);\n      const messages = [{ chatId, text: `${row['Booking ID']} moved: ${r.from} -> ${r.to}` }];\n      if (customer) messages.push({ chatId: customer, text: `Your booking ${row['Booking ID']} was moved to ${r.to}.` });\n      return { update: r.update, messages };\n    }\n    const status = statuses[cmd];\n    const messages = [{ chatId, text: `${row['Booking ID']} (${row['Name']}) -> ${status}` }];\n    const notice = {\n      Confirmed: `✅ Your booking ${row['Booking ID']} on ${row['Date']} ${row['Time slot']} is confirmed.`,\n      Cancelled: `Your booking ${row['Booking ID']} on ${row['Date']} ${row['Time slot']} was cancelled.`,\n      'No-show': NO_SHOW_TEXT(row),\n      Done: 'Thanks for visiting! See you next time. 🚗✨',\n    }[status];\n    if (customer && notice) messages.push({ chatId: customer, text: notice });\n    return { update: rowUpdate(row, { Status: status }), messages };\n  }\n\n  const mine = rows.filter(r => r['Chat ID'] && String(r['Chat ID']) === String(chatId));\n  if (!mine.length) return { askPhone: true };\n  const row = mine.filter(r => CHANGEABLE.includes(r['Status'])).pop();\n  if (!row) return reply('You have no active booking. Please book again using our form.');\n\n  if (cmd === '/cancel') {\n    return {\n      update: rowUpdate(row, { Status: 'Cancelled' }),\n      messages: [\n        { chatId, text: `Your booking ${row['Booking ID']} is cancelled.` },\n        { chatId: owner, text: `❌ Customer cancelled ${row['Booking ID']} (${row['Name']}, ${row['Date']} ${row['Time slot']})` },\n      ],\n    };\n  }\n  if (cmd === '/reschedule') {\n    const r = reschedule(rows, row, args[0], args[1], today, nowMin);\n    if (r.error) return reply(r.error);\n    return {\n      update: r.update,\n      messages: [\n        { chatId, text: `✅ Booking ${row['Booking ID']} moved to ${r.to}. We will confirm shortly.` },\n        { chatId: owner, text: `🔁 Customer rescheduled ${row['Booking ID']} (${row['Name']}): ${r.from} -> ${r.to}\\n\\n/confirm ${row['Booking ID']}` },\n      ],\n    };\n  }\n  return reply(summary(row) + '\\n\\n' + CUSTOMER_HELP);\n}\n\n// Workflow 4: bookings still New/Confirmed (not Arrived) past slot start + grace time.\nfunction findNoShows(rows, today, nowMin) {\n  return rows\n    .filter(r => r['Date'] === today && ACTIVE.includes(r['Status']) && slotMinutes(r['Time slot']) + NO_SHOW_GRACE_MIN <= nowMin)\n    .map(r => ({\n      row_number: r.row_number,\n      chatId: String(r['Chat ID'] || ''),\n      customerText: NO_SHOW_TEXT(r),\n      ownerText: `🚫 No-show: ${r['Booking ID']} ${r['Name']} ${r['Phone']} (${r['Time slot']}). Marked No-show.\\nIf they came, send /arrived ${r['Booking ID']}`,\n    }));\n}\n\n// Workflow 3: customers to remind about tomorrow (tomorrow is \"YYYY-MM-DD\").\nfunction dueReminders(rows, tomorrow) {\n  return rows\n    .filter(r => r['Date'] === tomorrow && ACTIVE.includes(r['Status']) && r['Chat ID'] && !r['Reminded'])\n    .map(r => ({\n      row_number: r.row_number,\n      chatId: r['Chat ID'],\n      text: `⏰ Reminder: your ${r['Service']} is tomorrow (${r['Date']}) at ${r['Time slot']}.\\nBooking ${r['Booking ID']} - ${r['Vehicle']}.\\nNeed to change? /reschedule YYYY-MM-DD HH:MM or /cancel`,\n    }));\n}\n\n// Workflow 3 and owner /today: the day's schedule.\nfunction ownerSummary(rows, date, label = 'Tomorrow') {\n  const list = rows\n    .filter(r => r['Date'] === date && HOLDS.includes(r['Status']))\n    .sort((a, b) => slotMinutes(a['Time slot']) - slotMinutes(b['Time slot']));\n  if (!list.length) return { text: `📅 No bookings for ${label.toLowerCase()} (${date}).` };\n  const lines = list.map(r => `${r['Time slot']} - ${r['Booking ID']} ${r['Service']} - ${r['Name']} (${r['Vehicle']}) ${r['Phone']} [${r['Status']}]`);\n  return { text: `📅 ${label} (${date}) - ${list.length} booking(s):\\n` + lines.join('\\n') };\n}\n\n\n// --- node ---\nreturn $('Handle command').first().json.messages.map(json => ({ json }));"
+      }
+    },
+    {
+      "id": "send-messages",
+      "name": "Send messages",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1980,
+        300
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "carwashTelegram1",
+          "name": "Carwash Telegram Bot"
+        }
+      }
+    },
+    {
+      "id": "ask-for-phone",
+      "name": "Ask for phone",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2200,
+        300
+      ],
+      "parameters": {
+        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+        "text": "Hi! Tap the button below to share your phone number so we can link your carwash booking.",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📱 Share my phone",
+                    "additionalFields": {
+                      "request_contact": true
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "one_time_keyboard": true,
+          "resize_keyboard": true
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "carwashTelegram1",
+          "name": "Carwash Telegram Bot"
+        }
+      }
+    },
+    {
+      "id": "read-all-bookings",
+      "name": "Read all bookings",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2420,
+        300
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Form Responses 1",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "carwashGoogle001",
+          "name": "Carwash Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "match-booking",
+      "name": "Match booking",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Booking logic shared by the n8n Code nodes. build.js inlines everything above the\n// \"--- exports ---\" marker into the workflows; test/booking.test.js tests it.\n// Rows are Google Sheets rows as n8n reads them: column headers as keys, plus row_number.\n\nconst SLOTS = ['8:00', '10:00', '13:00', '15:00']; // must match the form's Time slot dropdown\nconst NO_SHOW_GRACE_MIN = 30;\nconst HOLDS = ['New', 'Confirmed', 'Arrived']; // statuses that occupy a slot\nconst ACTIVE = ['New', 'Confirmed']; // statuses that get reminders / can become No-show\nconst CHANGEABLE = ['New', 'Confirmed', 'Conflict', 'No-show']; // customer may reschedule or cancel\n\n// Last 10 digits, so \"0917 123 4567\" and \"+63 917 123 4567\" match.\nfunction digits(phone) {\n  return String(phone || '').replace(/\\D/g, '').slice(-10);\n}\n\n// \"10:00\", \"10:00:00\" or \"10:00 AM\" -> minutes since midnight. Sheets may reformat the\n// slot text, so slots are always compared by minutes. NaN if unreadable.\nfunction slotMinutes(slot) {\n  const m = String(slot || '').trim().match(/^(\\d{1,2})(?::(\\d{2}))?(?::\\d{2})?\\s*([ap])?\\.?m?\\.?$/i);\n  if (!m) return NaN;\n  let h = +m[1] % (m[3] ? 12 : 24);\n  if (m[3] && /p/i.test(m[3])) h += 12;\n  return h * 60 + (+m[2] || 0);\n}\n\nfunction validDate(s) {\n  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(s || '')) return false;\n  const d = new Date(s + 'T00:00:00Z');\n  return !isNaN(d) && d.toISOString().slice(0, 10) === s;\n}\n\nfunction freeSlots(rows, date, except) {\n  return SLOTS.filter(s => !rows.some(r => r !== except && r['Date'] === date\n    && HOLDS.includes(r['Status']) && slotMinutes(r['Time slot']) === slotMinutes(s)));\n}\n\nfunction findById(rows, id) {\n  const n = parseInt(String(id || '').replace(/\\D/g, ''), 10);\n  return rows.find(r => r['Booking ID'] && parseInt(String(r['Booking ID']).replace(/\\D/g, ''), 10) === n);\n}\n\nfunction summary(r) {\n  return [\n    `Booking ${r['Booking ID']} (${r['Status']})`,\n    `Name: ${r['Name']}`,\n    `Phone: ${r['Phone']}`,\n    `Vehicle: ${r['Vehicle']}`,\n    `Service: ${r['Service']}`,\n    `When: ${r['Date']} ${r['Time slot']}`,\n    r['Notes'] ? `Notes: ${r['Notes']}` : '',\n  ].filter(Boolean).join('\\n');\n}\n\nconst CUSTOMER_HELP = 'Commands:\\n/mybooking - show your booking\\n/slots YYYY-MM-DD - free times on a day\\n/reschedule YYYY-MM-DD HH:MM - move your booking\\n/cancel - cancel your booking';\nconst OWNER_HELP = 'Owner commands (ID like CW-0003 or 3):\\n/today - today\\'s bookings\\n/confirm ID\\n/arrived ID\\n/done ID\\n/noshow ID\\n/cancel ID\\n/move ID YYYY-MM-DD HH:MM\\n/slots YYYY-MM-DD';\nconst NO_SHOW_TEXT = (r) => `We missed you for booking ${r['Booking ID']} (${r['Date']} ${r['Time slot']}).\\nTo book a new time, send /slots YYYY-MM-DD then /reschedule YYYY-MM-DD HH:MM.`;\n\n// Workflow 1: give every row without a Booking ID an ID and a status.\n// Earlier rows win a slot; Cancelled, Conflict, No-show rows don't hold one.\nfunction processNewBookings(rows) {\n  const sorted = [...rows].sort((a, b) => a.row_number - b.row_number);\n  const out = [];\n  for (const row of sorted) {\n    if (row['Booking ID']) continue;\n    const clash = sorted.some(o => o !== row && o['Booking ID']\n      && HOLDS.includes(o['Status'])\n      && o['Date'] === row['Date'] && slotMinutes(o['Time slot']) === slotMinutes(row['Time slot']));\n    row['Booking ID'] = 'CW-' + String(row.row_number).padStart(4, '0');\n    row['Status'] = clash ? 'Conflict' : 'New';\n    const head = clash ? '⚠️ SLOT ALREADY TAKEN - contact customer to rebook\\n' : '🚗 New booking\\n';\n    const hint = clash ? `\\n\\n/move ${row['Booking ID']} YYYY-MM-DD HH:MM` : `\\n\\n/confirm ${row['Booking ID']}`;\n    out.push({ row_number: row.row_number, bookingId: row['Booking ID'], status: row['Status'], text: head + summary(row) + hint });\n  }\n  return out;\n}\n\n// Workflow 2: customer shared their contact with the bot; find their latest booking.\nfunction matchBooking(rows, message) {\n  const chatId = message.chat.id;\n  const contact = message.contact;\n  // A user can also send someone else's contact card; only accept their own number.\n  if (!contact || contact.user_id !== message.from.id) {\n    return { found: false, chatId, text: 'Please tap the \"Share my phone\" button to send your own number.' };\n  }\n  const phone = digits(contact.phone_number);\n  const row = phone.length >= 7\n    ? rows.filter(r => digits(r['Phone']) === phone && r['Status'] !== 'Cancelled').pop()\n    : undefined;\n  if (!row) {\n    return { found: false, chatId, text: 'No booking found for this number. Please book using our form first, then come back here.' };\n  }\n  const note = row['Status'] === 'Conflict'\n    ? '\\n\\nSorry, this time slot is already taken. Send /slots YYYY-MM-DD to see free times, then /reschedule.'\n    : '\\n\\nYou will get a reminder here the day before.';\n  return { found: true, chatId, row_number: row.row_number, text: '✅ Booking linked!\\n\\n' + summary(row) + note + '\\n\\n' + CUSTOMER_HELP };\n}\n\n// Shared by owner /move and customer /reschedule. Returns { error } or { update, from, to }.\nfunction reschedule(rows, row, date, slot, today, nowMin) {\n  if (!validDate(date)) return { error: 'Use: YYYY-MM-DD HH:MM, e.g. /reschedule 2026-11-05 10:00' };\n  const label = SLOTS.find(s => slotMinutes(s) === slotMinutes(slot));\n  if (!label) return { error: `Time must be one of: ${SLOTS.join(', ')}` };\n  if (date < today || (date === today && slotMinutes(label) <= nowMin)) return { error: 'That time has already passed.' };\n  const free = freeSlots(rows, date, row);\n  if (!free.includes(label)) return { error: `${date} ${label} is taken. Free that day: ${free.join(', ') || 'none'}` };\n  return {\n    update: rowUpdate(row, { Date: date, 'Time slot': label, Status: 'New', Reminded: '' }),\n    from: `${row['Date']} ${row['Time slot']}`,\n    to: `${date} ${label}`,\n  };\n}\n\n// The bot workflow writes these 5 columns back for the changed row.\nfunction rowUpdate(row, changes) {\n  return { row_number: row.row_number, Date: row['Date'], 'Time slot': row['Time slot'], Status: row['Status'], Reminded: row['Reminded'] || '', ...changes };\n}\n\n// Workflow 2: any non-contact message. owner = OWNER_CHAT_ID, today = \"YYYY-MM-DD\",\n// nowMin = minutes since midnight. Returns { askPhone } or { update|null, messages: [{chatId, text}] }.\nfunction handleCommand(rows, message, owner, today, nowMin) {\n  const chatId = message.chat.id;\n  const [first = '', ...args] = String(message.text || '').trim().split(/\\s+/);\n  const cmd = first.toLowerCase().replace(/@.*/, ''); // \"/today@MyBot\" in groups\n  const reply = (text) => ({ update: null, messages: [{ chatId, text }] });\n\n  if (cmd === '/slots') {\n    if (!validDate(args[0])) return reply('Use: /slots YYYY-MM-DD');\n    const free = freeSlots(rows, args[0]).filter(s => args[0] > today || (args[0] === today && slotMinutes(s) > nowMin));\n    return reply(`Free times on ${args[0]}: ${free.join(', ') || 'none'}`);\n  }\n\n  if (String(chatId) === String(owner)) {\n    if (cmd === '/today') return reply(ownerSummary(rows, today, 'Today').text);\n    const statuses = { '/confirm': 'Confirmed', '/arrived': 'Arrived', '/done': 'Done', '/noshow': 'No-show', '/cancel': 'Cancelled' };\n    if (!statuses[cmd] && cmd !== '/move') return reply(OWNER_HELP);\n    const row = findById(rows, args[0]);\n    if (!row) return reply(`Booking ${args[0] || '(missing ID)'} not found.`);\n    const customer = row['Chat ID'];\n    if (cmd === '/move') {\n      const r = reschedule(rows, row, args[1], args[2], today, nowMin);\n      if (r.error) return reply(r.error);\n      const messages = [{ chatId, text: `${row['Booking ID']} moved: ${r.from} -> ${r.to}` }];\n      if (customer) messages.push({ chatId: customer, text: `Your booking ${row['Booking ID']} was moved to ${r.to}.` });\n      return { update: r.update, messages };\n    }\n    const status = statuses[cmd];\n    const messages = [{ chatId, text: `${row['Booking ID']} (${row['Name']}) -> ${status}` }];\n    const notice = {\n      Confirmed: `✅ Your booking ${row['Booking ID']} on ${row['Date']} ${row['Time slot']} is confirmed.`,\n      Cancelled: `Your booking ${row['Booking ID']} on ${row['Date']} ${row['Time slot']} was cancelled.`,\n      'No-show': NO_SHOW_TEXT(row),\n      Done: 'Thanks for visiting! See you next time. 🚗✨',\n    }[status];\n    if (customer && notice) messages.push({ chatId: customer, text: notice });\n    return { update: rowUpdate(row, { Status: status }), messages };\n  }\n\n  const mine = rows.filter(r => r['Chat ID'] && String(r['Chat ID']) === String(chatId));\n  if (!mine.length) return { askPhone: true };\n  const row = mine.filter(r => CHANGEABLE.includes(r['Status'])).pop();\n  if (!row) return reply('You have no active booking. Please book again using our form.');\n\n  if (cmd === '/cancel') {\n    return {\n      update: rowUpdate(row, { Status: 'Cancelled' }),\n      messages: [\n        { chatId, text: `Your booking ${row['Booking ID']} is cancelled.` },\n        { chatId: owner, text: `❌ Customer cancelled ${row['Booking ID']} (${row['Name']}, ${row['Date']} ${row['Time slot']})` },\n      ],\n    };\n  }\n  if (cmd === '/reschedule') {\n    const r = reschedule(rows, row, args[0], args[1], today, nowMin);\n    if (r.error) return reply(r.error);\n    return {\n      update: r.update,\n      messages: [\n        { chatId, text: `✅ Booking ${row['Booking ID']} moved to ${r.to}. We will confirm shortly.` },\n        { chatId: owner, text: `🔁 Customer rescheduled ${row['Booking ID']} (${row['Name']}): ${r.from} -> ${r.to}\\n\\n/confirm ${row['Booking ID']}` },\n      ],\n    };\n  }\n  return reply(summary(row) + '\\n\\n' + CUSTOMER_HELP);\n}\n\n// Workflow 4: bookings still New/Confirmed (not Arrived) past slot start + grace time.\nfunction findNoShows(rows, today, nowMin) {\n  return rows\n    .filter(r => r['Date'] === today && ACTIVE.includes(r['Status']) && slotMinutes(r['Time slot']) + NO_SHOW_GRACE_MIN <= nowMin)\n    .map(r => ({\n      row_number: r.row_number,\n      chatId: String(r['Chat ID'] || ''),\n      customerText: NO_SHOW_TEXT(r),\n      ownerText: `🚫 No-show: ${r['Booking ID']} ${r['Name']} ${r['Phone']} (${r['Time slot']}). Marked No-show.\\nIf they came, send /arrived ${r['Booking ID']}`,\n    }));\n}\n\n// Workflow 3: customers to remind about tomorrow (tomorrow is \"YYYY-MM-DD\").\nfunction dueReminders(rows, tomorrow) {\n  return rows\n    .filter(r => r['Date'] === tomorrow && ACTIVE.includes(r['Status']) && r['Chat ID'] && !r['Reminded'])\n    .map(r => ({\n      row_number: r.row_number,\n      chatId: r['Chat ID'],\n      text: `⏰ Reminder: your ${r['Service']} is tomorrow (${r['Date']}) at ${r['Time slot']}.\\nBooking ${r['Booking ID']} - ${r['Vehicle']}.\\nNeed to change? /reschedule YYYY-MM-DD HH:MM or /cancel`,\n    }));\n}\n\n// Workflow 3 and owner /today: the day's schedule.\nfunction ownerSummary(rows, date, label = 'Tomorrow') {\n  const list = rows\n    .filter(r => r['Date'] === date && HOLDS.includes(r['Status']))\n    .sort((a, b) => slotMinutes(a['Time slot']) - slotMinutes(b['Time slot']));\n  if (!list.length) return { text: `📅 No bookings for ${label.toLowerCase()} (${date}).` };\n  const lines = list.map(r => `${r['Time slot']} - ${r['Booking ID']} ${r['Service']} - ${r['Name']} (${r['Vehicle']}) ${r['Phone']} [${r['Status']}]`);\n  return { text: `📅 ${label} (${date}) - ${list.length} booking(s):\\n` + lines.join('\\n') };\n}\n\n\n// --- node ---\nreturn [{ json: matchBooking($input.all().map(i => i.json), $('Telegram Trigger').first().json.message) }];"
+      }
+    },
+    {
+      "id": "found-",
+      "name": "Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.found }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "save-chat-id",
+      "name": "Save Chat ID",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3080,
+        300
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Form Responses 1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "row_number": "={{ $json.row_number }}",
+            "Chat ID": "={{ $json.chatId }}"
+          },
+          "matchingColumns": [
+            "row_number"
+          ],
+          "schema": [
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Chat ID",
+              "displayName": "Chat ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "carwashGoogle001",
+          "name": "Carwash Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "reply-to-customer",
+      "name": "Reply to customer",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3300,
+        300
+      ],
+      "parameters": {
+        "chatId": "={{ $('Match booking').item.json.chatId }}",
+        "text": "={{ $('Match booking').item.json.text }}",
+        "replyMarkup": "replyKeyboardRemove",
+        "replyKeyboardRemove": {
+          "remove_keyboard": true
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "carwashTelegram1",
+          "name": "Carwash Telegram Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Shared contact?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shared contact?": {
+      "main": [
+        [
+          {
+            "node": "Read all bookings",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read bookings for command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read bookings for command": {
+      "main": [
+        [
+          {
+            "node": "Handle command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle command": {
+      "main": [
+        [
+          {
+            "node": "Not linked yet?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Not linked yet?": {
+      "main": [
+        [
+          {
+            "node": "Ask for phone",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Changes sheet?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Changes sheet?": {
+      "main": [
+        [
+          {
+            "node": "Apply change",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Split messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply change": {
+      "main": [
+        [
+          {
+            "node": "Split messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split messages": {
+      "main": [
+        [
+          {
+            "node": "Send messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read all bookings": {
+      "main": [
+        [
+          {
+            "node": "Match booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Match booking": {
+      "main": [
+        [
+          {
+            "node": "Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Found?": {
+      "main": [
+        [
+          {
+            "node": "Save Chat ID",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply to customer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Chat ID": {
+      "main": [
+        [
+          {
+            "node": "Reply to customer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}
