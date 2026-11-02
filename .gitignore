@@ -3,3 +3,4 @@
 service-account*.json
 config.json
 ~$*.docx
+graphify-out/
